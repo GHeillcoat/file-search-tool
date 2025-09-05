@@ -84,19 +84,23 @@ class FileSearchApp(QWidget):
         # 索引管理标签页
         index_tab = QWidget()
         index_layout = QVBoxLayout()
-        
-        
-
 
         # 索引操作按钮
         index_button_layout = QHBoxLayout()
-        self.create_index_button = QPushButton("创建/更新索引")
+        self.create_index_button = QPushButton("创建新索引")
         self.create_index_button.clicked.connect(self.start_indexing)
+        self.update_index_button = QPushButton("更新索引")
+        self.update_index_button.clicked.connect(self.start_update_indexing)
         self.clear_index_button = QPushButton("清空索引")
         self.clear_index_button.clicked.connect(self.clear_index_data)
+        # 在索引操作按钮部分添加
+        self.rebuild_db_button = QPushButton("重建数据库")
+        self.rebuild_db_button.clicked.connect(self.rebuild_database)
+        index_button_layout.addWidget(self.rebuild_db_button)
         self.refresh_info_button = QPushButton("刷新信息")
         self.refresh_info_button.clicked.connect(self.load_index_info)
         index_button_layout.addWidget(self.create_index_button)
+        index_button_layout.addWidget(self.update_index_button)
         index_button_layout.addWidget(self.clear_index_button)
         index_button_layout.addWidget(self.refresh_info_button)
         index_button_layout.addStretch()
@@ -170,25 +174,31 @@ class FileSearchApp(QWidget):
             self.status_bar.showMessage(f"已选择文件夹: {folder_path}")
 
     def start_indexing(self):
+        """创建新索引（会清空现有索引）"""
         folder_path = self.folder_path_input.text()
         if not folder_path or not os.path.isdir(folder_path):
             QMessageBox.warning(self, "错误", "请选择一个有效的文件夹。")
+            return
+
+        reply = QMessageBox.question(self, '创建新索引', 
+                                   '创建新索引将清空现有索引数据。确定要继续吗？',
+                                   QMessageBox.Yes | QMessageBox.No, 
+                                   QMessageBox.No)
+        if reply != QMessageBox.Yes:
             return
 
         # 清空日志
         self.index_log_text.clear()
         self.status_bar.showMessage("正在创建索引...")
         self.results_tree.clear()
-        self.create_index_button.setEnabled(False)
-        self.search_button.setEnabled(False)
-        self.clear_index_button.setEnabled(False)
+        self.set_index_buttons_enabled(False)
 
         # 获取设置
         max_file_size = self.max_file_size_spin.value() * 1024 * 1024
 
         self.indexer_thread = QThread()
         self.file_indexer = FileIndexer()
-        self.file_indexer.max_file_size = max_file_size  # 设置最大文件大小
+        self.file_indexer.max_file_size = max_file_size
         self.file_indexer.moveToThread(self.indexer_thread)
 
         self.file_indexer.indexing_progress.connect(self.update_index_log)
@@ -197,6 +207,42 @@ class FileSearchApp(QWidget):
 
         self.indexer_thread.started.connect(lambda: self.file_indexer.index_folder(folder_path))
         self.indexer_thread.start()
+
+    def start_update_indexing(self):
+        """增量更新索引"""
+        folder_path = self.folder_path_input.text()
+        if not folder_path or not os.path.isdir(folder_path):
+            QMessageBox.warning(self, "错误", "请选择一个有效的文件夹。")
+            return
+
+        # 清空日志
+        self.index_log_text.clear()
+        self.status_bar.showMessage("正在更新索引...")
+        self.results_tree.clear()
+        self.set_index_buttons_enabled(False)
+
+        # 获取设置
+        max_file_size = self.max_file_size_spin.value() * 1024 * 1024
+
+        self.indexer_thread = QThread()
+        self.file_indexer = FileIndexer()
+        self.file_indexer.max_file_size = max_file_size
+        self.file_indexer.moveToThread(self.indexer_thread)
+
+        self.file_indexer.indexing_progress.connect(self.update_index_log)
+        self.file_indexer.indexing_finished.connect(self.indexing_finished)
+        self.file_indexer.indexing_error.connect(self.indexing_error)
+
+        self.indexer_thread.started.connect(lambda: self.file_indexer.update_index(folder_path))
+        self.indexer_thread.start()
+
+    def set_index_buttons_enabled(self, enabled):
+        """设置索引相关按钮的启用状态"""
+        self.create_index_button.setEnabled(enabled)
+        self.update_index_button.setEnabled(enabled)
+        self.search_button.setEnabled(enabled)
+        self.clear_index_button.setEnabled(enabled)
+        self.rebuild_db_button.setEnabled(enabled)
 
     def update_index_log(self, message):
         """更新索引日志"""
@@ -208,10 +254,8 @@ class FileSearchApp(QWidget):
         self.status_bar.showMessage(message)
 
     def indexing_finished(self, count):
-        self.status_bar.showMessage(f"索引创建完成。已索引 {count} 个文件。")
-        self.create_index_button.setEnabled(True)
-        self.search_button.setEnabled(True)
-        self.clear_index_button.setEnabled(True)
+        self.status_bar.showMessage(f"索引操作完成。")
+        self.set_index_buttons_enabled(True)
         self.indexer_thread.quit()
         self.indexer_thread.wait()
         
@@ -221,10 +265,8 @@ class FileSearchApp(QWidget):
     def indexing_error(self, message):
         self.index_log_text.append(f"错误: {message}")
         QMessageBox.critical(self, "索引错误", message)
-        self.status_bar.showMessage("索引创建失败。")
-        self.create_index_button.setEnabled(True)
-        self.search_button.setEnabled(True)
-        self.clear_index_button.setEnabled(True)
+        self.status_bar.showMessage("索引操作失败。")
+        self.set_index_buttons_enabled(True)
         self.indexer_thread.quit()
         self.indexer_thread.wait()
 
@@ -270,6 +312,7 @@ class FileSearchApp(QWidget):
 - 文件总大小：{info['total_size_str']}
 - 索引文件大小：{info['index_size_str']}
 - 压缩率：{info['compression_ratio']}
+- 最后索引时间：{info['last_indexed']}
 """
             self.index_info_text.setText(info_text)
             
@@ -298,6 +341,7 @@ class FileSearchApp(QWidget):
         self.status_bar.showMessage(f"正在搜索 '{keyword}'...")
         self.results_tree.clear()
         self.create_index_button.setEnabled(False)
+        self.update_index_button.setEnabled(False)
         self.search_button.setEnabled(False)
 
         self.search_thread = QThread()
@@ -410,6 +454,7 @@ class FileSearchApp(QWidget):
         
         self.status_bar.showMessage(f"搜索完成。找到 {total_results if 'total_results' in locals() else len(results)} 个匹配项。")
         self.create_index_button.setEnabled(True)
+        self.update_index_button.setEnabled(True)
         self.search_button.setEnabled(True)
         self.search_thread.quit()
         self.search_thread.wait()
@@ -531,14 +576,13 @@ class FileSearchApp(QWidget):
         # 传入一个虚拟文件路径，因为我们只关心命令是否能执行
         # 实际不会打开文件
         return self.open_file_in_vscode("dummy_file.txt", 1)
+
     def clear_index_data(self):
         reply = QMessageBox.question(self, '清空索引', '确定要清空所有索引数据吗？此操作不可逆。',
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
             self.status_bar.showMessage("正在清空索引...")
-            self.create_index_button.setEnabled(False)
-            self.search_button.setEnabled(False)
-            self.clear_index_button.setEnabled(False)
+            self.set_index_buttons_enabled(False)
 
             self.indexer_thread = QThread()
             self.file_indexer = FileIndexer()
@@ -551,11 +595,44 @@ class FileSearchApp(QWidget):
             self.indexer_thread.finished.connect(self.clear_index_finished)
             self.indexer_thread.start()
 
+    def rebuild_database(self):
+        """重建数据库（删除旧数据库文件并创建新的）"""
+        reply = QMessageBox.question(
+            self, '重建数据库', 
+            '这将删除现有数据库并创建新的空数据库。\n所有索引数据将丢失，需要重新创建索引。\n\n确定要继续吗？',
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            try:
+                # 删除数据库文件
+                db_path = "file_index.db"
+                if os.path.exists(db_path):
+                    os.remove(db_path)
+                    # 也删除可能存在的 WAL 和 SHM 文件
+                    if os.path.exists(db_path + "-wal"):
+                        os.remove(db_path + "-wal")
+                    if os.path.exists(db_path + "-shm"):
+                        os.remove(db_path + "-shm")
+                
+                # 清空显示
+                self.index_info_text.clear()
+                self.file_type_table.setRowCount(0)
+                self.index_log_text.clear()
+                self.results_tree.clear()
+                
+                QMessageBox.information(self, "成功", "数据库已重建。请重新创建索引。")
+                self.status_bar.showMessage("数据库已重建")
+                
+                # 刷新索引信息
+                self.load_index_info()
+                
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"重建数据库失败：{str(e)}")
     def clear_index_finished(self):
         self.status_bar.showMessage("索引已清空。")
-        self.create_index_button.setEnabled(True)
-        self.search_button.setEnabled(True)
-        self.clear_index_button.setEnabled(True)
+        self.set_index_buttons_enabled(True)
         self.indexer_thread.quit()
         self.indexer_thread.wait()
         
@@ -566,6 +643,7 @@ class FileSearchApp(QWidget):
         QMessageBox.critical(self, "搜索错误", message)
         self.status_bar.showMessage("搜索失败。")
         self.create_index_button.setEnabled(True)
+        self.update_index_button.setEnabled(True)
         self.search_button.setEnabled(True)
         self.clear_index_button.setEnabled(True)
         self.search_thread.quit()

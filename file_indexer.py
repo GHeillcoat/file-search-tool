@@ -1,6 +1,8 @@
 import os
 import sqlite3
 import mimetypes
+import hashlib
+from datetime import datetime
 from PyQt5.QtCore import QObject, pyqtSignal
 
 class FileIndexer(QObject):
@@ -174,7 +176,21 @@ class FileIndexer(QObject):
             return False
 
     def create_tables(self):
-        # 文件表
+        # 首先检查是否需要升级表结构
+        self.cursor.execute("PRAGMA table_info(files)")
+        columns = [col[1] for col in self.cursor.fetchall()]
+        
+        # 如果表存在但缺少新列，则添加它们
+        if 'files' in [t[0] for t in self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]:
+            if 'file_hash' not in columns:
+                self.cursor.execute("ALTER TABLE files ADD COLUMN file_hash TEXT")
+                self.indexing_progress.emit("升级数据库：添加 file_hash 列")
+            
+            if 'modified_time' not in columns:
+                self.cursor.execute("ALTER TABLE files ADD COLUMN modified_time REAL")
+                self.indexing_progress.emit("升级数据库：添加 modified_time 列")
+        
+        # 创建或更新文件表
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,6 +198,8 @@ class FileIndexer(QObject):
                 file_name TEXT NOT NULL,
                 file_size INTEGER,
                 file_ext TEXT,
+                file_hash TEXT,
+                modified_time REAL,
                 indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -221,6 +239,9 @@ class FileIndexer(QObject):
         self.cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_files_ext ON files(file_ext)
         """)
+        self.cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_files_hash ON files(file_hash)
+        """)
         
         if not self.fts_enabled:
             # 为普通表创建额外的索引
@@ -238,6 +259,20 @@ class FileIndexer(QObject):
             self.cursor.execute("DELETE FROM file_contents")
             self.conn.commit()
             self.indexing_progress.emit("旧索引已清除。")
+
+    def calculate_file_hash(self, file_path, chunk_size=8192):
+        """计算文件的MD5哈希值"""
+        md5_hash = hashlib.md5()
+        try:
+            with open(file_path, "rb") as f:
+                while chunk := f.read(chunk_size):
+                    md5_hash.update(chunk)
+                    # 对于大文件，只读取前1MB来计算哈希
+                    if f.tell() >= 1024 * 1024:
+                        break
+            return md5_hash.hexdigest()
+        except Exception:
+            return None
 
     def should_skip_directory(self, dir_name):
         """检查是否应该跳过该目录"""
@@ -301,7 +336,204 @@ class FileIndexer(QObject):
         
         return False, file_size, "unknown"
 
+    def index_file(self, file_path, file_id=None):
+        """索引单个文件的内容"""
+        try:
+            # 如果有旧的file_id，先删除旧内容
+            if file_id:
+                self.cursor.execute("DELETE FROM file_contents WHERE file_id = ?", (file_id,))
+            
+            # 获取文件信息
+            file_name = os.path.basename(file_path)
+            file_size = os.path.getsize(file_path)
+            _, ext = os.path.splitext(file_path.lower())
+            modified_time = os.path.getmtime(file_path)
+            file_hash = self.calculate_file_hash(file_path)
+            
+            if not file_hash:
+                return None
+            
+            # 插入或更新文件记录
+            if file_id:
+                self.cursor.execute("""
+                    UPDATE files 
+                    SET file_name = ?, file_size = ?, file_ext = ?, 
+                        file_hash = ?, modified_time = ?, indexed_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (file_name, file_size, ext, file_hash, modified_time, file_id))
+            else:
+                self.cursor.execute("""
+                    INSERT INTO files (file_path, file_name, file_size, file_ext, file_hash, modified_time)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (file_path, file_name, file_size, ext, file_hash, modified_time))
+                file_id = self.cursor.lastrowid
+            
+            # 读取并索引文件内容
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                batch_data = []
+                
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    # 跳过空行和过长的行
+                    if line and len(line) < 1000:
+                        batch_data.append((file_id, line_num, line))
+                        
+                        # 批量插入以提高性能
+                        if len(batch_data) >= 1000:
+                            self.cursor.executemany(
+                                "INSERT INTO file_contents (file_id, line_number, content) VALUES (?, ?, ?)",
+                                batch_data
+                            )
+                            batch_data = []
+                    
+                    # 防止大文件占用过多内存
+                    if line_num > 10000:
+                        break
+                
+                # 插入剩余的数据
+                if batch_data:
+                    self.cursor.executemany(
+                        "INSERT INTO file_contents (file_id, line_number, content) VALUES (?, ?, ?)",
+                        batch_data
+                    )
+            
+            return file_id
+            
+        except Exception as e:
+            self.indexing_error.emit(f"索引文件失败 {file_path}: {str(e)}")
+            return None
+
+    def update_index(self, folder_path):
+        """增量更新索引"""
+        if not self.connect_db():
+            return
+
+        stats = {
+            'new': 0,
+            'updated': 0,
+            'deleted': 0,
+            'unchanged': 0,
+            'skipped': 0,
+            'errors': 0,
+            'total_size': 0
+        }
+        
+        # 获取当前索引中的所有文件
+        self.cursor.execute("SELECT id, file_path, file_hash, modified_time FROM files WHERE file_path LIKE ?", 
+                           (f"{folder_path}%",))
+        existing_files = {row[1]: {'id': row[0], 'hash': row[2], 'mtime': row[3]} 
+                         for row in self.cursor.fetchall()}
+        
+        # 用于跟踪处理过的文件
+        processed_files = set()
+        
+        # 开始事务
+        self.conn.execute("BEGIN TRANSACTION")
+        
+        try:
+            for root, dirs, files in os.walk(folder_path):
+                # 过滤掉不需要的目录
+                dirs[:] = [d for d in dirs if not self.should_skip_directory(d)]
+                
+                # 显示当前处理的目录
+                rel_path = os.path.relpath(root, folder_path)
+                if rel_path != '.':
+                    self.indexing_progress.emit(f"扫描目录: {rel_path}")
+                
+                for file_name in files:
+                    file_path = os.path.join(root, file_name)
+                    processed_files.add(file_path)
+                    
+                    # 检查是否应该索引该文件
+                    should_index, file_size, reason = self.should_index_file(file_path)
+                    
+                    if not should_index:
+                        stats['skipped'] += 1
+                        continue
+                    
+                    try:
+                        # 计算文件哈希和修改时间
+                        file_hash = self.calculate_file_hash(file_path)
+                        modified_time = os.path.getmtime(file_path)
+                        
+                        if not file_hash:
+                            stats['errors'] += 1
+                            continue
+                        
+                        # 检查文件是否已存在于索引中
+                        if file_path in existing_files:
+                            existing_info = existing_files[file_path]
+                            
+                            # 比较哈希值和修改时间
+                            if (existing_info['hash'] == file_hash and 
+                                abs(existing_info['mtime'] - modified_time) < 1):
+                                # 文件未变化
+                                stats['unchanged'] += 1
+                                self.indexing_progress.emit(f"未变化: {file_name}")
+                            else:
+                                # 文件已变化，需要更新
+                                if self.index_file(file_path, existing_info['id']):
+                                    stats['updated'] += 1
+                                    stats['total_size'] += file_size
+                                    self.indexing_progress.emit(f"已更新: {file_name}")
+                                else:
+                                    stats['errors'] += 1
+                        else:
+                            # 新文件
+                            if self.index_file(file_path):
+                                stats['new'] += 1
+                                stats['total_size'] += file_size
+                                self.indexing_progress.emit(f"新文件: {file_name}")
+                            else:
+                                stats['errors'] += 1
+                        
+                        # 每100个文件提交一次
+                        if (stats['new'] + stats['updated']) % 100 == 0:
+                            self.conn.commit()
+                            self.conn.execute("BEGIN TRANSACTION")
+                            
+                    except Exception as e:
+                        stats['errors'] += 1
+                        self.indexing_error.emit(f"处理文件失败 {file_name}: {str(e)}")
+            
+            # 删除不存在的文件
+            for file_path, file_info in existing_files.items():
+                if file_path not in processed_files:
+                    # 文件已被删除
+                    self.cursor.execute("DELETE FROM file_contents WHERE file_id = ?", (file_info['id'],))
+                    self.cursor.execute("DELETE FROM files WHERE id = ?", (file_info['id'],))
+                    stats['deleted'] += 1
+                    self.indexing_progress.emit(f"已删除: {os.path.basename(file_path)}")
+            
+            # 提交最终事务
+            self.conn.commit()
+            
+            # 优化数据库（仅在有较大变化时）
+            if stats['new'] + stats['updated'] + stats['deleted'] > 100:
+                self.indexing_progress.emit("正在优化数据库...")
+                self.cursor.execute("VACUUM")
+                self.cursor.execute("ANALYZE")
+            
+        except Exception as e:
+            self.conn.rollback()
+            self.indexing_error.emit(f"更新索引过程出错: {str(e)}")
+        finally:
+            if self.conn:
+                self.conn.close()
+                self.conn = None
+                self.cursor = None
+        
+        # 生成统计信息
+        total_processed = stats['new'] + stats['updated'] + stats['unchanged']
+        self.indexing_progress.emit(
+            f"更新完成：新增 {stats['new']} 个，更新 {stats['updated']} 个，"
+            f"删除 {stats['deleted']} 个，未变化 {stats['unchanged']} 个，"
+            f"跳过 {stats['skipped']} 个，错误 {stats['errors']} 个"
+        )
+        self.indexing_finished.emit(total_processed)
+
     def index_folder(self, folder_path):
+        """创建新索引（清空旧索引）"""
         if not self.connect_db():
             return
 
@@ -340,52 +572,12 @@ class FileIndexer(QObject):
                         continue
                     
                     try:
-                        # 获取文件扩展名
-                        _, ext = os.path.splitext(file_path.lower())
-                        
-                        # 插入文件记录
-                        self.cursor.execute(
-                            "INSERT OR IGNORE INTO files (file_path, file_name, file_size, file_ext) VALUES (?, ?, ?, ?)",
-                            (file_path, file_name, file_size, ext)
-                        )
-                        file_id = self.cursor.lastrowid
-                        
-                        if file_id == 0:  # 文件已存在
-                            self.cursor.execute("SELECT id FROM files WHERE file_path = ?", (file_path,))
-                            file_id = self.cursor.fetchone()[0]
-                        
-                        # 读取并索引文件内容
-                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                            batch_data = []
-                            
-                            for line_num, line in enumerate(f, 1):
-                                line = line.strip()
-                                # 跳过空行和过长的行
-                                if line and len(line) < 1000:
-                                    batch_data.append((file_id, line_num, line))
-                                    
-                                    # 批量插入以提高性能
-                                    if len(batch_data) >= 1000:
-                                        self.cursor.executemany(
-                                            "INSERT INTO file_contents (file_id, line_number, content) VALUES (?, ?, ?)",
-                                            batch_data
-                                        )
-                                        batch_data = []
-                                
-                                # 防止大文件占用过多内存
-                                if line_num > 10000:
-                                    break
-                            
-                            # 插入剩余的数据
-                            if batch_data:
-                                self.cursor.executemany(
-                                    "INSERT INTO file_contents (file_id, line_number, content) VALUES (?, ?, ?)",
-                                    batch_data
-                                )
-                        
-                        stats['indexed'] += 1
-                        stats['total_size'] += file_size
-                        self.indexing_progress.emit(f"已索引: {file_name}")
+                        if self.index_file(file_path):
+                            stats['indexed'] += 1
+                            stats['total_size'] += file_size
+                            self.indexing_progress.emit(f"已索引: {file_name}")
+                        else:
+                            stats['errors'] += 1
                         
                         # 每100个文件提交一次
                         if stats['indexed'] % 100 == 0:
@@ -573,6 +765,11 @@ class FileIndexer(QObject):
                 info['compression_ratio'] = f"{(db_size / total_size * 100):.1f}%"
             else:
                 info['compression_ratio'] = "N/A"
+            
+            # 获取最后索引时间
+            self.cursor.execute("SELECT MAX(indexed_at) FROM files")
+            last_indexed = self.cursor.fetchone()[0]
+            info['last_indexed'] = last_indexed or "从未索引"
             
             return info
         except:

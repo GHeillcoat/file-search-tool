@@ -27,4 +27,4 @@ yarn-error.log*
 .env.*
 **.db
 
-file_index.db
+file_index.*
